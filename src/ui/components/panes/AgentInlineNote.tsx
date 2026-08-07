@@ -1,13 +1,19 @@
 import { createTextAttributes, type TextareaRenderable } from "@opentui/core";
-import { flushSync } from "@opentui/react";
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 import type { AgentAnnotation, DiffFile, LayoutMode } from "../../../core/types";
 import { agentNoteBoxLayout } from "../../lib/agentNoteGeometry";
 import { annotationRangeLabel, reviewNoteSource } from "../../lib/agentAnnotations";
 import { wrapText } from "../../lib/agentPopover";
 
 import { sanitizeTerminalLine } from "../../../lib/terminalText";
-import { fitText, measureTextWidth, padText } from "../../lib/text";
+import {
+  fitText,
+  isPrintableAsciiText,
+  measureClusterWidth,
+  measureTextWidth,
+  padText,
+  textClusters,
+} from "../../lib/text";
 import { resolveStmlColor } from "../../lib/stml/colors";
 import { layoutStmlCached, type StmlLine, type StmlSpan } from "../../lib/stml/layout";
 import type { AppTheme } from "../../themes";
@@ -48,30 +54,46 @@ export function agentInlineNoteMarkupLines(
   return lines.length > 0 ? lines : null;
 }
 
-function draftLineCount(text: string) {
-  return Math.max(1, text.split("\n").length);
+/** Measure one grapheme cluster the way the composer renders it: a tab takes two cells. */
+function draftClusterCells(cluster: string) {
+  return cluster === "\t" ? 2 : measureClusterWidth(cluster);
 }
 
-/** Estimate the textarea's wrapped visual row count for a given content width. */
-function draftVisualLineCount(text: string, width: number) {
+/**
+ * Count the composer's visual rows for one body at one content width.
+ *
+ * The textarea wraps by character without splitting a grapheme cluster: a
+ * cluster that would cross the row boundary moves to the next row whole, so
+ * at an odd width a wide CJK character leaves one cell unused. This count
+ * must match the editor exactly: the row-windowed stream plans note heights
+ * from it before the card mounts, and the editor clamps its wrap count to
+ * its viewport height, so an undercount would hide rows instead of
+ * revealing them.
+ */
+export function draftVisualLineCount(text: string, width: number) {
   const usableWidth = Math.max(1, width);
-  return Math.max(
-    1,
-    text
-      .split("\n")
-      .reduce((total, line) => total + Math.max(1, Math.ceil(line.length / usableWidth)), 0),
-  );
-}
+  let rows = 0;
 
-function isNewlineKey(key: { ctrl?: boolean; name?: string; sequence?: string }) {
-  return (
-    key.name === "return" ||
-    key.name === "enter" ||
-    key.name === "linefeed" ||
-    key.sequence === "\r" ||
-    key.sequence === "\n" ||
-    (key.ctrl && key.name === "j")
-  );
+  for (const line of text.split("\n")) {
+    if (isPrintableAsciiText(line)) {
+      rows += Math.max(1, Math.ceil(line.length / usableWidth));
+      continue;
+    }
+
+    let used = 0;
+    let lineRows = 1;
+    for (const cluster of textClusters(line)) {
+      const cells = draftClusterCells(cluster);
+      if (used > 0 && used + cells > usableWidth) {
+        lineRows++;
+        used = 0;
+      }
+      used += cells;
+    }
+    rows += lineRows;
+  }
+
+  return rows;
 }
 
 /** Wrap text while preserving author-entered line breaks in review notes. */
@@ -158,13 +180,6 @@ export function AgentInlineNote({
   width: number;
 }) {
   const textareaRef = useRef<TextareaRenderable | null>(null);
-  const [draftLineCountHint, setDraftLineCountHint] = useState(() =>
-    draftLineCount(draft?.body ?? ""),
-  );
-
-  useEffect(() => {
-    setDraftLineCountHint(draftLineCount(draft?.body ?? ""));
-  }, [draft?.body]);
 
   useLayoutEffect(() => {
     if (!draft) {
@@ -208,9 +223,7 @@ export function AgentInlineNote({
   const closeWidth = closeText.length;
   const draftInnerWidth = Math.max(1, boxWidth - 2);
   const draftContentWidth = Math.max(1, draftInnerWidth - 2);
-  const draftVisibleRows = draft
-    ? Math.max(draftLineCountHint, draftVisualLineCount(draft.body, draftContentWidth))
-    : 0;
+  const draftVisibleRows = draft ? draftVisualLineCount(draft.body, draftContentWidth) : 0;
 
   useLayoutEffect(() => {
     if (!draft || draftVisibleRows <= 0) {
@@ -232,12 +245,6 @@ export function AgentInlineNote({
     textarea.editorView.setViewport(viewport.offsetX, 0, viewport.width, draftVisibleRows, false);
     textarea.requestRender();
   }, [draft, draftVisibleRows]);
-
-  const updateDraftLineCountHint = (nextLineCount: number) => {
-    flushSync(() => {
-      setDraftLineCountHint(nextLineCount);
-    });
-  };
 
   const lines = agentInlineNoteBodyLines(annotation, contentWidth);
   const savedTitleText = fitText(
@@ -354,36 +361,20 @@ export function AgentInlineNote({
             initialValue={draft.body}
             placeholder="Write a note…"
             focused={draft.focused}
+            wrapMode="char"
             backgroundColor={theme.panel}
             textColor={theme.text}
             focusedBackgroundColor={theme.panel}
             focusedTextColor={theme.text}
             keyBindings={[{ name: "j", ctrl: true, action: "newline" }]}
             onContentChange={() => {
-              const textarea = textareaRef.current;
-              const nextBody = textarea?.plainText ?? "";
-              updateDraftLineCountHint(
-                Math.max(
-                  draftVisualLineCount(nextBody, draftContentWidth),
-                  textarea?.virtualLineCount ?? 0,
-                ),
-              );
+              const nextBody = textareaRef.current?.plainText ?? "";
+              // Deliberately not flushSync: burst input (chunked paste, key
+              // repeat) emits many content changes in one stack, and forcing a
+              // synchronous render per change nests renders until React hits
+              // its nested-update limit. Batched propagation commits before
+              // the next frame, so the resize still lands with the edit.
               draft.onInput(nextBody);
-            }}
-            onKeyDown={(key) => {
-              // Escape (cancel) and Ctrl-S (save) never reach this textarea:
-              // the global key chain owns and consumes them while the draft is
-              // focused (`useAppKeyboardShortcuts`, focus area "note"). Only
-              // sizing bookkeeping for keys the editor itself handles lives
-              // here.
-              if (isNewlineKey(key)) {
-                updateDraftLineCountHint(
-                  draftVisualLineCount(
-                    textareaRef.current?.plainText ?? draft.body,
-                    draftContentWidth,
-                  ) + 1,
-                );
-              }
             }}
           />
           <box style={{ width: 1, height: draftTextareaRows, backgroundColor: theme.panel }} />
