@@ -1,4 +1,9 @@
-import { createTextAttributes, type TextareaRenderable } from "@opentui/core";
+import {
+  createTextAttributes,
+  EditBuffer,
+  EditorView,
+  type TextareaRenderable,
+} from "@opentui/core";
 import { useLayoutEffect, useRef, type ReactNode } from "react";
 import type { AgentAnnotation, DiffFile, LayoutMode } from "../../../core/types";
 import { agentNoteBoxLayout } from "../../lib/agentNoteGeometry";
@@ -6,14 +11,7 @@ import { annotationRangeLabel, reviewNoteSource } from "../../lib/agentAnnotatio
 import { wrapText } from "../../lib/agentPopover";
 
 import { sanitizeTerminalLine } from "../../../lib/terminalText";
-import {
-  fitText,
-  isPrintableAsciiText,
-  measureClusterWidth,
-  measureTextWidth,
-  padText,
-  textClusters,
-} from "../../lib/text";
+import { fitText, measureTextWidth, padText } from "../../lib/text";
 import { resolveStmlColor } from "../../lib/stml/colors";
 import { layoutStmlCached, type StmlLine, type StmlSpan } from "../../lib/stml/layout";
 import type { AppTheme } from "../../themes";
@@ -54,46 +52,30 @@ export function agentInlineNoteMarkupLines(
   return lines.length > 0 ? lines : null;
 }
 
-/** Measure one grapheme cluster the way the composer renders it: a tab takes two cells. */
-function draftClusterCells(cluster: string) {
-  return cluster === "\t" ? 2 : measureClusterWidth(cluster);
-}
+let draftMeasureView: { buffer: EditBuffer; view: EditorView } | null = null;
 
 /**
  * Count the composer's visual rows for one body at one content width.
  *
- * The textarea wraps by character without splitting a grapheme cluster: a
- * cluster that would cross the row boundary moves to the next row whole, so
- * at an odd width a wide CJK character leaves one cell unused. This count
- * must match the editor exactly: the row-windowed stream plans note heights
- * from it before the card mounts, and the editor clamps its wrap count to
- * its viewport height, so an undercount would hide rows instead of
- * revealing them.
+ * Measured through the editor's own native buffer because JS width tables
+ * disagree with it on some clusters (e.g. an emoji flag followed by a
+ * combining mark). This count must match the editor exactly: the
+ * row-windowed stream plans note heights from it before the card mounts,
+ * and the editor clamps its wrap count to its viewport height, so an
+ * undercount would hide rows instead of revealing them.
  */
 export function draftVisualLineCount(text: string, width: number) {
-  const usableWidth = Math.max(1, width);
-  let rows = 0;
-
-  for (const line of text.split("\n")) {
-    if (isPrintableAsciiText(line)) {
-      rows += Math.max(1, Math.ceil(line.length / usableWidth));
-      continue;
-    }
-
-    let used = 0;
-    let lineRows = 1;
-    for (const cluster of textClusters(line)) {
-      const cells = draftClusterCells(cluster);
-      if (used > 0 && used + cells > usableWidth) {
-        lineRows++;
-        used = 0;
-      }
-      used += cells;
-    }
-    rows += lineRows;
+  if (!draftMeasureView) {
+    const buffer = EditBuffer.create("unicode");
+    const view = EditorView.create(buffer, 1, 1);
+    view.setWrapMode("char");
+    draftMeasureView = { buffer, view };
   }
 
-  return rows;
+  const { buffer, view } = draftMeasureView;
+  view.setViewport(0, 0, Math.max(1, width), 1);
+  buffer.setText(text);
+  return view.getTotalVirtualLineCount();
 }
 
 /** Wrap text while preserving author-entered line breaks in review notes. */

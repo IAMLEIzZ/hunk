@@ -42,6 +42,8 @@ describe("draftVisualLineCount", () => {
     ["tab is two cells", "a\tb", 3, 2],
     ["tab fits wider box", "a\tb", 4, 1],
     ["tab after content", "aaaaaaaa\taa", 10, 2],
+    ["emoji flag with combining mark", "HEAD-" + "🇺🇸\u0301".repeat(10) + "-TAIL", 24, 2],
+    ["bare heart emoji", "❤".repeat(13), 24, 2],
     ["width clamps to one", "ab", 0, 2],
   ];
 
@@ -70,6 +72,8 @@ describe("draftVisualLineCount editor parity", () => {
     "e\u0301".repeat(12),
     "a".repeat(10) + "e\u0301",
     "👨‍👩‍👧".repeat(6),
+    "HEAD-" + "🇺🇸\u0301".repeat(10) + "-TAIL",
+    "❤".repeat(13),
     "a  b   c",
     "aaaaaaaaaa ",
     "aaa\nbbb",
@@ -147,11 +151,11 @@ function renderedCardRowCount(frame: string) {
   return bottom - top + 1;
 }
 
-function plannedCardHeight(body: string, width: number) {
+function plannedCardHeight(body: string, width: number, layout: "split" | "stack" = "split") {
   return measureAgentInlineNoteHeight({
     annotation: draftAnnotation(body),
     anchorSide: "new",
-    layout: "split",
+    layout,
     width,
   });
 }
@@ -213,6 +217,40 @@ describe("AgentInlineNote draft composer", () => {
       expect(frame).toContain(typed.slice(0, 10));
       expect(frame).toContain(typed.slice(-10));
       expect(renderedCardRowCount(frame)).toBe(plannedCardHeight(typed, 96));
+    } finally {
+      await act(async () => {
+        setup.renderer.destroy();
+      });
+    }
+  });
+
+  test("renders drafts with clusters that JS width tables mismeasure", async () => {
+    // 30 cells by the editor's native width tables; JS tables count 20.
+    const body = "HEAD-" + "🇺🇸\u0301".repeat(10) + "-TAIL";
+    const setup = await testRender(
+      <AgentInlineNote
+        annotation={draftAnnotation(body)}
+        anchorSide="new"
+        layout="stack"
+        theme={theme}
+        width={34}
+        draft={{
+          body,
+          focused: true,
+          onInput: () => {},
+          onCancel: () => {},
+          onSave: () => {},
+        }}
+      />,
+      { width: 60, height: 30 },
+    );
+
+    try {
+      await flush(setup);
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("HEAD-");
+      expect(frame).toContain("TAIL");
+      expect(renderedCardRowCount(frame)).toBe(plannedCardHeight(body, 34, "stack"));
     } finally {
       await act(async () => {
         setup.renderer.destroy();
